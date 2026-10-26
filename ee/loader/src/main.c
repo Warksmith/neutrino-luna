@@ -5,7 +5,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include "luna_handoff.h"
 #include <malloc.h>
+void _libcglue_args_parse(int argc, char **argv);
 _off64_t lseek64 (int __filedes, _off64_t __offset, int __whence); // should be defined in unistd.h ???
 
 // PS2SDK
@@ -470,6 +472,14 @@ done:
 
 int main(int argc, char *argv[])
 {
+    // Copy LUNA's resident argv before any loader operation reuses scratch RAM.
+    int handoff = luna_handoff_expand(&argc, &argv);
+    if (handoff < 0) {
+        printf("ERROR: invalid LUNA launch arguments\n");
+        return -1;
+    }
+    // Restore the usual startup CWD using the full executable path.
+    if (handoff > 0) _libcglue_args_parse(argc, argv);
     int i, j;
     char sGameID[12];
     int fd_system_cnf;

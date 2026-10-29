@@ -102,11 +102,14 @@ static int mmce_send_gameid(void)
         printf("WARNING: no MMCE in %s, card not switched\n", device);
         return -1;
     }
-    for (int i = 0; i < 30; i++) {
-        mmce_wait_ms(500);
+    // The switch usually completes at once: check every 20 ms, after 100 ms
+    // for the busy bit to be set, and still give up after 15 seconds.
+    mmce_wait_ms(100);
+    for (int i = 0; i < 745; i++) {
         status = fileXioDevctl(device, 0x2, NULL, 0, NULL, 0);
         if (status >= 0 && (status & 1) == 0)
             break;
+        mmce_wait_ms(20);
     }
     printf("MMCE %s switched to %s\n", device, id);
     return 0;

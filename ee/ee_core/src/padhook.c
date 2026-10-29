@@ -37,6 +37,31 @@
 static int (*scePadPortOpen)(int port, int slot, void *addr);
 static int (*scePad2CreateSocket)(pad2socketparam_t *SocketParam, void *addr);
 
+static pattern_t padopen_patterns[NB_PADOPEN_PATTERN] = {
+    {padPortOpenpattern0, padPortOpenpattern0_mask, sizeof(padPortOpenpattern0), 1, 0x0211},
+    {pad2CreateSocketpattern0, pad2CreateSocketpattern0_mask, sizeof(pad2CreateSocketpattern0), 2, 0x0200},
+    {pad2CreateSocketpattern1, pad2CreateSocketpattern1_mask, sizeof(pad2CreateSocketpattern1), 2, 0x0200},
+    {pad2CreateSocketpattern2, pad2CreateSocketpattern2_mask, sizeof(pad2CreateSocketpattern2), 2, 0x0200},
+    {padPortOpenpattern1, padPortOpenpattern1_mask, sizeof(padPortOpenpattern1), 1, 0x0210},
+    {padPortOpenpattern2, padPortOpenpattern2_mask, sizeof(padPortOpenpattern2), 1, 0x0160},
+    {padPortOpenpattern3, padPortOpenpattern3_mask, sizeof(padPortOpenpattern3), 1, 0x0150}};
+
+// Matches kept per pattern from the single memory pass. Further matches of a
+// pattern are found with the original incremental search.
+#define PADOPEN_MAX_MATCHES 8
+// Call sites patched with a hook. While all of them still hold the hook, the
+// PadOpen calls are hooked and a full rescan cannot patch anything new.
+#define PADOPEN_MAX_SITES 32
+
+static int padopen_pattern_idx = -1;
+static u32 *padopen_sites[PADOPEN_MAX_SITES];
+static u32 padopen_site_inst[PADOPEN_MAX_SITES];
+static int padopen_site_count = 0;
+static int padopen_site_overflow = 0;
+// Set once the hooked pad buffer has been seen updating. A pad that stalls
+// after that may have lost its hook, so it gets a full rescan as before.
+static int padopen_pad_live = 0;
+
 static paddata_t Pad_Data;
 static int IGR_Thread_ID = -1;
 static int IGR_Intc_ID = -1;
@@ -238,6 +263,8 @@ static int IGR_Intc_Handler(int cause)
             ((Pad_Data.libpad == IGR_LIBPAD2) && (pad_pos_state == IGR_PAD_STABLE_V2))) {
             if (Pad_Data.vb_count++ >= 10) {
                 padOpen_hooked = (pad_pos_frame != Pad_Data.prev_frame);
+                if (padOpen_hooked)
+                    padopen_pad_live = 1;
                 Pad_Data.prev_frame = pad_pos_frame;
                 Pad_Data.vb_count = 0;
             }
@@ -355,6 +382,10 @@ void Reset_Padhook(void)
     IGR_Intc_ID = -1;
     IGR_Thread_ID = -1;
     padOpen_hooked = 0;
+    padopen_pattern_idx = -1;
+    padopen_site_count = 0;
+    padopen_site_overflow = 0;
+    padopen_pad_live = 0;
 }
 
 // Hook function for libpad scePadPortOpen
@@ -402,39 +433,156 @@ static int Hook_scePad2CreateSocket(pad2socketparam_t *SocketParam, void *addr)
     return ret;
 }
 
+static int padopen_pattern_matches(const u32 *ptr, const pattern_t *pat)
+{
+    int j, len = pat->size >> 2;
+
+    for (j = 0; j < len; j++) {
+        if ((ptr[j] & pat->mask[j]) != pat->pattern[j])
+            return 0;
+    }
+
+    return 1;
+}
+
+// The saved PadOpen function still matches its libpad pattern.
+static int padopen_function_intact(void)
+{
+    const pattern_t *pat;
+    u32 *ptr;
+
+    if (padopen_pattern_idx < 0)
+        return 0;
+
+    pat = &padopen_patterns[padopen_pattern_idx];
+    ptr = pat->type == IGR_LIBPAD ? (u32 *)scePadPortOpen : (u32 *)scePad2CreateSocket;
+    return ptr != NULL && padopen_pattern_matches(ptr, pat);
+}
+
+// Every patched call site still holds the hook and PadOpen is unchanged.
+static int padopen_hook_intact(void)
+{
+    int i;
+
+    if (padopen_site_count == 0 || padopen_site_overflow || !padopen_function_intact())
+        return 0;
+
+    for (i = 0; i < padopen_site_count; i++) {
+        if (*padopen_sites[i] != padopen_site_inst[i])
+            return 0;
+    }
+
+    return 1;
+}
+
+static void padopen_record_site(u32 *site, u32 inst)
+{
+    int i, kept = 0;
+
+    // Forget sites the game has since overwritten.
+    for (i = 0; i < padopen_site_count; i++) {
+        if (*padopen_sites[i] == padopen_site_inst[i]) {
+            padopen_sites[kept] = padopen_sites[i];
+            padopen_site_inst[kept] = padopen_site_inst[i];
+            kept++;
+        }
+    }
+    padopen_site_count = kept;
+
+    if (padopen_site_count >= PADOPEN_MAX_SITES) {
+        padopen_site_overflow = 1;
+        return;
+    }
+
+    padopen_sites[padopen_site_count] = site;
+    padopen_site_inst[padopen_site_count] = inst;
+    padopen_site_count++;
+}
+
+#define PADOPEN_FIRST_WORD 0x27bdff00
+
+// Same result as find_pattern_with_mask() for a one-word pattern, as a tight
+// loop: this search covers all of user memory for every hook installation.
+static u32 *padopen_find_word(u32 *ptr, u32 mem_end, u32 pattern, u32 mask)
+{
+    u32 *end = (u32 *)mem_end - 1;
+
+    for (; ptr < end; ptr++) {
+        if ((*ptr & mask) == pattern)
+            return ptr;
+    }
+
+    return NULL;
+}
+
+// Single pass over memory for all libpad patterns. Gives the same matches,
+// in the same order, as one find_pattern_with_mask() loop per pattern.
+static void padopen_collect(u32 mem_start, u32 mem_end, u32 *matches[NB_PADOPEN_PATTERN][PADOPEN_MAX_MATCHES], int counts[NB_PADOPEN_PATTERN])
+{
+    u32 *ptr, *end = (u32 *)mem_end;
+    u32 *next[NB_PADOPEN_PATTERN];
+    const pattern_t *pat;
+    u32 word;
+    int i;
+
+    for (i = 0; i < NB_PADOPEN_PATTERN; i++) {
+        counts[i] = 0;
+        next[i] = (u32 *)mem_start;
+    }
+
+    for (ptr = (u32 *)mem_start; ptr < end; ptr++) {
+        word = *ptr;
+        // Every libpad PadOpen pattern starts with "addiu sp, sp, -N" (0x27bdffXX).
+        // Reject other words with one compare instead of one per pattern.
+        if ((word >> 8) != (PADOPEN_FIRST_WORD >> 8))
+            continue;
+        for (i = 0; i < NB_PADOPEN_PATTERN; i++) {
+            pat = &padopen_patterns[i];
+            if ((word & pat->mask[0]) != pat->pattern[0] || ptr < next[i])
+                continue;
+            if (ptr + (pat->size >> 2) >= end || !padopen_pattern_matches(ptr, pat))
+                continue;
+
+            if (counts[i] < PADOPEN_MAX_MATCHES)
+                matches[i][counts[i]] = ptr;
+            counts[i]++;
+            next[i] = ptr + (pat->size >> 2);
+        }
+    }
+}
+
 // This function patch the padOpen calls. (scePadPortOpen or scePad2CreateSocket)
 int Install_PadOpen_Hook(u32 mem_start, u32 mem_end, int mode)
 {
     u32 *ptr, *ptr2;
     u32 inst, fncall;
-    u32 mem_size, mem_size2;
+    u32 mem_size;
     u32 pattern[1], mask[1];
-    int i, found, patched;
+    u32 *matches[NB_PADOPEN_PATTERN][PADOPEN_MAX_MATCHES];
+    int counts[NB_PADOPEN_PATTERN];
+    int i, m, found, patched;
 
-    pattern_t padopen_patterns[NB_PADOPEN_PATTERN] = {
-        {padPortOpenpattern0, padPortOpenpattern0_mask, sizeof(padPortOpenpattern0), 1, 0x0211},
-        {pad2CreateSocketpattern0, pad2CreateSocketpattern0_mask, sizeof(pad2CreateSocketpattern0), 2, 0x0200},
-        {pad2CreateSocketpattern1, pad2CreateSocketpattern1_mask, sizeof(pad2CreateSocketpattern1), 2, 0x0200},
-        {pad2CreateSocketpattern2, pad2CreateSocketpattern2_mask, sizeof(pad2CreateSocketpattern2), 2, 0x0200},
-        {padPortOpenpattern1, padPortOpenpattern1_mask, sizeof(padPortOpenpattern1), 1, 0x0210},
-        {padPortOpenpattern2, padPortOpenpattern2_mask, sizeof(padPortOpenpattern2), 1, 0x0160},
-        {padPortOpenpattern3, padPortOpenpattern3_mask, sizeof(padPortOpenpattern3), 1, 0x0150}};
+    // Already hooked and the pad has not stalled since: a full rescan would
+    // find every call patched and change nothing.
+    if (mode == PADOPEN_HOOK && !padopen_pad_live && padopen_hook_intact())
+        return 1;
+    if (mode == PADOPEN_CHECK && padopen_function_intact())
+        return 0;
+
+    padopen_collect(mem_start, mem_end, matches, counts);
 
     found = 0;
     patched = 0;
 
     // Loop for each libpad version
     for (i = 0; i < NB_PADOPEN_PATTERN; i++) {
-        ptr = (u32 *)mem_start;
+        m = 0;
+        ptr = counts[i] > 0 ? matches[i][0] : NULL;
         while (ptr) {
             // Purple while PadOpen pattern search
             if (EnableDebug)
                 DBGCOL(0x800080, PADHOOK, "Searching PadOpen() pattern");
 
-            mem_size = mem_end - (u32)ptr;
-
-            // First try to locate the orginal libpad's PadOpen function
-            ptr = find_pattern_with_mask(ptr, mem_size, padopen_patterns[i].pattern, padopen_patterns[i].mask, padopen_patterns[i].size);
             if (ptr) {
                 DPRINTF("IGR: found padopen pattern%d at 0x%08x mode=%d\n", i, (int)ptr, mode);
                 found = 1;
@@ -448,6 +596,7 @@ int Install_PadOpen_Hook(u32 mem_start, u32 mem_end, int mode)
                     scePadPortOpen = (void *)ptr;
                 else
                     scePad2CreateSocket = (void *)ptr;
+                padopen_pattern_idx = i;
 
                 if (mode == PADOPEN_HOOK) {
                     // Generate generic instruction pattern & mask for a J/JAL to PadOpen()
@@ -463,9 +612,7 @@ int Install_PadOpen_Hook(u32 mem_start, u32 mem_end, int mode)
                     // Search & patch for calls to PadOpen
                     ptr2 = (u32 *)mem_start;
                     while (ptr2) {
-                        mem_size2 = (u32)((u8 *)mem_end - (u8 *)ptr2);
-
-                        ptr2 = find_pattern_with_mask(ptr2, mem_size2, pattern, mask, sizeof(pattern));
+                        ptr2 = padopen_find_word(ptr2, mem_end, pattern[0], mask[0]);
                         if (ptr2) {
                             DPRINTF("IGR: found padOpen call at 0x%08x\n", (int)ptr2);
 
@@ -488,6 +635,7 @@ int Install_PadOpen_Hook(u32 mem_start, u32 mem_end, int mode)
                             DPRINTF("IGR: patching padopen call at addr 0x%08x with opcode %08x\n", (int)fncall, (int)inst);
                             // Overwrite the original PadOpen function call with our function call
                             _sw(inst, fncall);
+                            padopen_record_site(ptr2, inst);
 
                             Pad_Data.libpad = padopen_patterns[i].type;
                             Pad_Data.libversion = padopen_patterns[i].version;
@@ -507,9 +655,7 @@ int Install_PadOpen_Hook(u32 mem_start, u32 mem_end, int mode)
                         // Search & patch for PadOpen function address
                         ptr2 = (u32 *)mem_start;
                         while (ptr2) {
-                            mem_size2 = (u32)((u8 *)mem_end - (u8 *)ptr2);
-
-                            ptr2 = find_pattern_with_mask(ptr2, mem_size2, pattern, mask, sizeof(pattern));
+                            ptr2 = padopen_find_word(ptr2, mem_end, pattern[0], mask[0]);
                             if (ptr2) {
                                 DPRINTF("IGR: found padOpen call at 0x%08x\n", (int)ptr2);
 
@@ -529,6 +675,7 @@ int Install_PadOpen_Hook(u32 mem_start, u32 mem_end, int mode)
                                 DPRINTF("IGR: patching padopen call at addr 0x%08x with opcode %08x\n", (int)fncall, (int)inst);
                                 // Overwrite the original PadOpen function address with our function address
                                 _sw(inst, fncall);
+                                padopen_record_site(ptr2, inst);
 
                                 Pad_Data.libpad = padopen_patterns[i].type;
                                 Pad_Data.libversion = padopen_patterns[i].version;
@@ -541,9 +688,18 @@ int Install_PadOpen_Hook(u32 mem_start, u32 mem_end, int mode)
                     break;
                 }
 
-                // Increment search pointer
-                // ptr += padopen_patterns[i].size;
-                ptr += (padopen_patterns[i].size >> 2);
+                // Next match: from the single pass, then with the original
+                // incremental search once more matches exist than were kept.
+                m++;
+                if (m < counts[i] && m < PADOPEN_MAX_MATCHES) {
+                    ptr = matches[i][m];
+                } else if (m < counts[i]) {
+                    ptr += (padopen_patterns[i].size >> 2);
+                    mem_size = mem_end - (u32)ptr;
+                    ptr = find_pattern_with_mask(ptr, mem_size, padopen_patterns[i].pattern, padopen_patterns[i].mask, padopen_patterns[i].size);
+                } else {
+                    ptr = NULL;
+                }
             }
         }
 

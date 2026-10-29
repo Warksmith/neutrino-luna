@@ -67,13 +67,31 @@ static void luna_return_home(void)
     char *argv[2];
     t_ExecData elf;
 
+    int services = 0;
+
     SifInitRpc(0);
+
+    // An MMCE card the loader switched to a per-game card goes back to its
+    // boot card on the clean IOP, before any MCMAN probes it, so both return
+    // targets find the launcher again.
+    if (eec.MmceIgrModule != NULL) {
+        SifInitIopHeap();
+        SifLoadFileInit();
+        sbv_patch_enable_lmb();
+        services = 1;
+        SifExecModuleBuffer((void *)eec.MmceIgrModule, eec.MmceIgrSize,
+                            sizeof(eec.MmceIgrArgs), eec.MmceIgrArgs, NULL);
+    }
 
     // The HDD-chain target deliberately does not remount the game drive from
     // the resident IGR environment. Return through the standard PS2 browser
     // path so the console initializes the HDD and executes the installed
     // ROCKET MBR. GalaxyHDD maps the still-held START trigger back to LUNA.
     if (eec.ExitPath[0] == 'h' && eec.ExitPath[1] == 'd' && eec.ExitPath[2] == 'd' && eec.ExitPath[3] == '\0') {
+        if (services) {
+            SifExitIopHeap();
+            SifLoadFileExit();
+        }
         SifExitRpc();
         FlushCache(WRITEBACK_DCACHE);
         FlushCache(INVALIDATE_ICACHE);
@@ -83,9 +101,11 @@ static void luna_return_home(void)
 
     // Reset_Iop() leaves the EE-side RPC/load-file clients shut down. Rebuild
     // them before loading the memory-card modules and the launcher ELF.
-    SifInitIopHeap();
-    SifLoadFileInit();
-    sbv_patch_enable_lmb();
+    if (!services) {
+        SifInitIopHeap();
+        SifLoadFileInit();
+        sbv_patch_enable_lmb();
+    }
 
     sbv_patch_disable_prefix_check();
 

@@ -55,6 +55,77 @@ void _libcglue_rtc_update() {}; // Disable rtc update
 
 struct SModule mod_ee_core;
 
+/*
+ * LUNA: an MMCE card that also holds the launcher can only switch to a
+ * per-game card after every file has been read from it. The switch is armed
+ * only together with IGR, which runs mmceigr.irx to restore the boot card
+ * before the launcher is reloaded.
+ */
+static struct SModule mod_mmceigr = {.sFileName = "mmceigr.irx"};
+
+static int mmce_gameid_valid(const char *arg)
+{
+    size_t len;
+
+    if (arg == NULL || (arg[0] != '0' && arg[0] != '1') || arg[1] != ':')
+        return 0;
+    len = strlen(&arg[2]);
+    return len > 0 && len <= 250; // MMCE Set GameID limit
+}
+
+// The loader disables the extra timer functions, so pace polling on COP0 Count.
+static void mmce_wait_ms(unsigned int ms)
+{
+    uint32_t start, now;
+
+    while (ms--) {
+        __asm__ __volatile__("mfc0 %0, $9" : "=r"(start));
+        do {
+            __asm__ __volatile__("mfc0 %0, $9" : "=r"(now));
+        } while ((uint32_t)(now - start) < 294912); // EE clock / 1000
+    }
+}
+
+// Uses the mmceman driver resident from the launcher. Returns 0 once switched.
+static int mmce_send_gameid(void)
+{
+    char device[] = "mmceX:";
+    const char *id = &sys.sMMCEGameID[2];
+    int status;
+
+    device[4] = sys.sMMCEGameID[0];
+    if (fileXioInit() < 0)
+        return -1;
+    // 0x1 = ping, 0x8 = set GameID, 0x2 = status (bit 0 = busy)
+    if (fileXioDevctl(device, 0x1, NULL, 0, NULL, 0) < 0 ||
+        fileXioDevctl(device, 0x8, (void *)id, strlen(id) + 1, NULL, 0) < 0) {
+        printf("WARNING: no MMCE in %s, card not switched\n", device);
+        return -1;
+    }
+    for (int i = 0; i < 30; i++) {
+        mmce_wait_ms(500);
+        status = fileXioDevctl(device, 0x2, NULL, 0, NULL, 0);
+        if (status >= 0 && (status & 1) == 0)
+            break;
+    }
+    printf("MMCE %s switched to %s\n", device, id);
+    return 0;
+}
+
+// Copies mmceigr.irx behind the module data and arms the IGR restore.
+static uint8_t *mmce_install_igr(uint8_t *irxptr_end)
+{
+    uint8_t *irx = (uint8_t *)(((uint32_t)irxptr_end + 0xF) & ~0xF);
+
+    memcpy(irx, mod_mmceigr.pData, mod_mmceigr.iSize);
+    sys.eecore.MmceIgrModule  = irx;
+    sys.eecore.MmceIgrSize    = mod_mmceigr.iSize;
+    sys.eecore.MmceIgrArgs[0] = (sys.sMMCEGameID[0] == '0') ? '1' : '0';
+    sys.eecore.MmceIgrArgs[1] = (sys.sMMCEGameID[0] == '1') ? '1' : '0';
+    sys.eecore.MmceIgrArgs[2] = '\0';
+    return irx + mod_mmceigr.iSize;
+}
+
 void print_usage()
 {
     printf("Usage: neutrino.elf options\n");
@@ -138,6 +209,9 @@ void print_usage()
     printf("  -udpfs_ip=<ip>    Override the UDPFS console IPv4 address\n");
     printf("  -igr=<target>     Enable LUNA in-game return. Use hdd for the HDD boot chain,\n");
     printf("                    or provide an mc0:/mc1: ELF path for direct return\n");
+    printf("  -mmce_gameid=<slot>:<id>\n");
+    printf("                    Switch the MMCE card in slot 0 or 1 to a per-game card after\n");
+    printf("                    all files are read. Requires -igr, which restores the boot card\n");
     printf("\n");
     printf("  -dbc              Enable debug colors\n");
     printf("  -logo             Enable logo (adds rom0:PS2LOGO to arguments)\n");
@@ -203,6 +277,8 @@ static int parse_cmdline_args(int argc, char *argv[], int *out_iELFArgcStart)
             sys.sUDPFSIP = &argv[i][10];
         else if (!strncmp(argv[i], "-igr=", 5))
             sys.sIGRPath = &argv[i][5];
+        else if (!strncmp(argv[i], "-mmce_gameid=", 13))
+            sys.sMMCEGameID = &argv[i][13];
         else if (!strncmp(argv[i], "-cwd=", 5))
             continue; // already handled before config loading
         else if (!strncmp(argv[i], "-dbc", 4))
@@ -811,6 +887,23 @@ int main(int argc, char *argv[])
     }
 
     /*
+     * LUNA: MMCE GameID for the launcher's own card. Without IGR nothing
+     * would restore the boot card, so the card is left alone.
+     */
+    if (sys.sMMCEGameID != NULL) {
+        if (!mmce_gameid_valid(sys.sMMCEGameID) || sys.sIGRPath == NULL ||
+            sys.sIGRPath[0] == '\0' || module_load(&mod_mmceigr) < 0) {
+            printf("WARNING: MMCE GameID ignored\n");
+            sys.sMMCEGameID = NULL;
+        } else if (sys.bQuickBoot == 0) {
+            // Rebooting into the load environment removes mmceman, so switch now.
+            if (mmce_send_gameid() < 0)
+                sys.sMMCEGameID = NULL;
+            fileXioExit();
+        }
+    }
+
+    /*
      * **********************************************************************
      * Changing from Boot Environment (BE) to Load Environment (LE)
      * After this point, modules and configs can no longer be accessed
@@ -1179,6 +1272,12 @@ int main(int argc, char *argv[])
         sys.eecore.CheatList = (int *)irxptr_end;
         irxptr_end = (uint8_t *)(cheatptr + sys.cheats_count + 2);
     }
+
+    // LUNA: QuickBoot keeps mmceman resident, and no file is read after this
+    // point, so the launcher's card can switch now. Arm the IGR restore only
+    // for a card that actually switched.
+    if (sys.sMMCEGameID != NULL && (sys.bQuickBoot == 0 || mmce_send_gameid() == 0))
+        irxptr_end = mmce_install_igr(irxptr_end);
 
     // Add simple checksum over the module data
     uint32_t *pms = (uint32_t *)irxtable;

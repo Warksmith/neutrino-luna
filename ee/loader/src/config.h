@@ -33,6 +33,7 @@ struct SSystemSettings {
     char *sCFGFile;
     char *sCheatPayload;
     char *sIGRPath;
+    char *sMMCEGameID; // LUNA: "<slot>:<title ID>"
     char *sUDPFSIP;
     int bDebug;
     int bLogo;

@@ -75,6 +75,13 @@ struct ee_core_data
     void *ModStorageEnd;
     // Checksums for modules at: 0x95000 - 0xb5000 = 128KiB
     uint32_t mod_checksum_4k[EEC_MOD_CHECKSUM_COUNT];
+
+    // LUNA: mmceigr.irx in module storage, kept outside the IOP reboot table.
+    // IGR runs it to return a switched MMCE card to its boot card. NULL when
+    // the loader did not switch a card.
+    const void *MmceIgrModule;
+    uint32_t MmceIgrSize;
+    char MmceIgrArgs[4]; // mmceigr slot mask: "10" = slot 1, "01" = slot 2
 } __attribute__((packed, aligned(4)));
 
 extern struct ee_core_data eec;

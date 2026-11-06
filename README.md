@@ -173,6 +173,12 @@ Options:
                     browser/HDD boot chain, or an mc0:/mc1: path for direct return.
                     Example: -igr=hdd
 
+  -mmce_gameid=<slot>:<id>
+                    Switch the launcher's MMCE card after loading its files,
+                    and restore its boot card on IGR. Slot is 0 or 1.
+                    Requires -igr and the matching modules/mmceigr.irx.
+                    Example: -mmce_gameid=0:SLUS_201.52
+
   --b               Break, all following parameters are passed to the ELF
 
 Usage examples:
@@ -193,6 +199,46 @@ matters when switching build flags: without it, Make may reuse a hardware
 loader that rejects `host:` and returns to the PS2 browser. Copy the resulting
 `ee/loader/neutrino.elf` to the emulator runtime only. Rebuild without the flag
 for hardware packages, which use `hdd`, `mc0:`, or `mc1:` return targets.
+
+## IGR with an MMCE launcher card
+
+Install the complete matching runtime, including `neutrino.elf`,
+`modules/ee_core.elf` and `modules/mmceigr.irx`. The loader checks the EE core's
+settings signature and size before switching cards or resetting the IOP.
+Older EE cores are deliberately rejected: their settings layout cannot
+safely receive this loader's restore configuration.
+
+When the frontend supplies `-mmce_gameid=0:SLUS_201.52`, it must leave the card
+switch to Neutrino. The loader reads its files before switching, preserves
+the restore module in resident memory, and runs it after the IGR IOP reset,
+before MCMAN opens the return ELF. The selected slot returns to its boot card;
+this does not restore an arbitrary previously selected numbered or named card.
+
+For direct return to RIPPS2, place the ELF on the restored boot card and use:
+
+```text
+-igr=mc0:/RIPPS2/RIPPS2.ELF -mmce_gameid=0:SLUS_201.52
+```
+
+Adjust the slot and GameID for the installation. This direct memory-card
+route needs no BIBLE bridge. An ELF on MMCE SD still needs a boot loader that
+can access that device. `-igr=hdd` uses the console's browser/HDD boot chain;
+it does not directly load an ELF from MMCE SD.
+
+Invalid return paths, missing restore modules and failed GameID requests now
+stop launch instead of silently discarding the requested behavior. Exhausted
+card-status polling also stops launch, rather than claiming the switch
+succeeded. Selection may be uncertain after a timeout: restart before retrying.
+The polling budget assumes individual driver calls return; it is not a
+watchdog for a hung driver. Module reads handle partial reads and interrupts,
+and settings scans remain within the loaded file.
+
+The `af68bf4-IGR-h1` test package, containing these source changes, was confirmed
+to return directly to RIPPS2 on the restored memory card. The original test
+setup used Ace Combat 4 over UDPFS. The pinned LUNA target build and host
+ASan/UBSan checks also passed. Host checks cover both slots and launch modes,
+core layout mismatches/truncation, module read failures, invalid return paths,
+and MMCE errors/timeouts; those broader cases are not all hardware-verified.
 
 ## UDPFS / UDPBD PC Server
 

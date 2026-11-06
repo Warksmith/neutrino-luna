@@ -107,12 +107,14 @@ static int mmce_send_gameid(void)
     mmce_wait_ms(100);
     for (int i = 0; i < 745; i++) {
         status = fileXioDevctl(device, 0x2, NULL, 0, NULL, 0);
-        if (status >= 0 && (status & 1) == 0)
-            break;
+        if (status >= 0 && (status & 1) == 0) {
+            printf("MMCE %s switched to %s\n", device, id);
+            return 0;
+        }
         mmce_wait_ms(20);
     }
-    printf("MMCE %s switched to %s\n", device, id);
-    return 0;
+    printf("ERROR: MMCE %s did not become ready; card selection uncertain. Restart before retrying.\n", device);
+    return -1;
 }
 
 // Copies mmceigr.irx behind the module data and arms the IGR restore.
@@ -884,9 +886,42 @@ int main(int argc, char *argv[])
         printf("ERROR: failed to load ee_core\n");
         return -1;
     }
+    // Validate before any card switch or IOP reset. Older cores have a smaller
+    // settings structure and cannot safely accept this loader's restore data.
+    struct ee_core_data *set_ee_core = module_get_eecore_settings(&mod_ee_core);
+    if (set_ee_core == NULL) {
+        printf("ERROR: incompatible ee_core.elf; install the complete matching Neutrino folder\n");
+        return -1;
+    }
+    sys.eecore.magic = EECORE_SETTINGS_MAGIC;
+    sys.eecore.SettingsSize = sizeof(sys.eecore);
     if (modlist_load(&drv.mod, (sys.bQuickBoot == 0) ? (MOD_ENV_LE | MOD_ENV_EE) : MOD_ENV_EE) < 0) {
         printf("ERROR: failed to load drv.mod\n");
         return -1;
+    }
+
+    // Reject invalid return targets before changing the launcher card.
+    if (sys.sIGRPath != NULL && sys.sIGRPath[0] != '\0') {
+        int invalid_igr_device = strcmp(sys.sIGRPath, EECORE_EXIT_HDD_CHAIN) &&
+                                 strncmp(sys.sIGRPath, "mc0:", 4) && strncmp(sys.sIGRPath, "mc1:", 4);
+#ifdef LUNA_EMULATOR_HOST_IGR
+        invalid_igr_device = invalid_igr_device && strncmp(sys.sIGRPath, "host:", 5);
+#endif
+        if (invalid_igr_device) {
+#ifdef LUNA_EMULATOR_HOST_IGR
+            printf("ERROR: -igr target must be hdd, mc0:, mc1:, or emulator host:\n");
+#else
+            printf("ERROR: -igr target must be hdd, mc0:, or mc1:\n");
+#endif
+            return -1;
+        }
+        if (strlen(sys.sIGRPath) >= sizeof(sys.eecore.ExitPath)) {
+            printf("ERROR: -igr path is too long (maximum %u characters)\n", (unsigned int)sizeof(sys.eecore.ExitPath) - 1);
+            return -1;
+        }
+        strncpy(sys.eecore.ExitPath, sys.sIGRPath, sizeof(sys.eecore.ExitPath) - 1);
+        sys.eecore.ExitPath[sizeof(sys.eecore.ExitPath) - 1] = '\0';
+        sys.eecore.flags |= EECORE_FLAG_IGR;
     }
 
     /*
@@ -896,12 +931,14 @@ int main(int argc, char *argv[])
     if (sys.sMMCEGameID != NULL) {
         if (!mmce_gameid_valid(sys.sMMCEGameID) || sys.sIGRPath == NULL ||
             sys.sIGRPath[0] == '\0' || module_load(&mod_mmceigr) < 0) {
-            printf("WARNING: MMCE GameID ignored\n");
-            sys.sMMCEGameID = NULL;
+            printf("ERROR: MMCE GameID requires a valid slot:GameID, -igr target, and modules/mmceigr.irx\n");
+            return -1;
         } else if (sys.bQuickBoot == 0) {
             // Rebooting into the load environment removes mmceman, so switch now.
-            if (mmce_send_gameid() < 0)
-                sys.sMMCEGameID = NULL;
+            if (mmce_send_gameid() < 0) {
+                fileXioExit();
+                return -1;
+            }
             fileXioExit();
         }
     }
@@ -946,9 +983,6 @@ int main(int argc, char *argv[])
         if (modlist_get_by_name(&drv.mod, "fileXio.irx") != NULL)
             fileXioInit();
     }
-
-    // Load EE_CORE settings
-    struct ee_core_data *set_ee_core = module_get_settings(&mod_ee_core);
 
     // Detect active FHI backing store and zero its settings struct
     int fhi_active = (fhi_config_init(&drv.mod) == 0);
@@ -1243,28 +1277,6 @@ int main(int argc, char *argv[])
     strncpy(sys.eecore.GameID, sGameID, 12);
     sys.eecore.CheatList     = NULL;
     sys.eecore.ModStorageEnd = irxptr_end;
-    if (sys.sIGRPath != NULL && sys.sIGRPath[0] != '\0') {
-        int invalid_igr_device = strcmp(sys.sIGRPath, EECORE_EXIT_HDD_CHAIN) &&
-                                 strncmp(sys.sIGRPath, "mc0:", 4) && strncmp(sys.sIGRPath, "mc1:", 4);
-#ifdef LUNA_EMULATOR_HOST_IGR
-        invalid_igr_device = invalid_igr_device && strncmp(sys.sIGRPath, "host:", 5);
-#endif
-        if (invalid_igr_device) {
-#ifdef LUNA_EMULATOR_HOST_IGR
-            printf("ERROR: -igr target must be hdd, mc0:, mc1:, or emulator host:\n");
-#else
-            printf("ERROR: -igr target must be hdd, mc0:, or mc1:\n");
-#endif
-            return -1;
-        }
-        if (strlen(sys.sIGRPath) >= sizeof(sys.eecore.ExitPath)) {
-            printf("ERROR: -igr path is too long (maximum %u characters)\n", (unsigned int)sizeof(sys.eecore.ExitPath) - 1);
-            return -1;
-        }
-        strncpy(sys.eecore.ExitPath, sys.sIGRPath, sizeof(sys.eecore.ExitPath) - 1);
-        sys.eecore.ExitPath[sizeof(sys.eecore.ExitPath) - 1] = '\0';
-        sys.eecore.flags |= EECORE_FLAG_IGR;
-    }
 
     // Append cheat data after IRX table and point CheatList to it
     if (sys.cheats != NULL && sys.cheats_count > 0) {
@@ -1279,8 +1291,11 @@ int main(int argc, char *argv[])
     // LUNA: QuickBoot keeps mmceman resident, and no file is read after this
     // point, so the launcher's card can switch now. Arm the IGR restore only
     // for a card that actually switched.
-    if (sys.sMMCEGameID != NULL && (sys.bQuickBoot == 0 || mmce_send_gameid() == 0))
+    if (sys.sMMCEGameID != NULL) {
+        if (sys.bQuickBoot && mmce_send_gameid() < 0)
+            return -1;
         irxptr_end = mmce_install_igr(irxptr_end);
+    }
 
     // Add simple checksum over the module data
     uint32_t *pms = (uint32_t *)irxtable;

@@ -55,6 +55,8 @@ enum EECORE_GSM_COMP_MODE
 
 // Interface to loader
 #define EEC_MOD_CHECKSUM_COUNT 32
+// Separate from generic IRX settings: loader and EE core must agree on this ABI.
+#define EECORE_SETTINGS_MAGIC 0x45454302
 struct ee_core_data
 {
     // Magic number to find
@@ -82,6 +84,7 @@ struct ee_core_data
     const void *MmceIgrModule;
     uint32_t MmceIgrSize;
     char MmceIgrArgs[4]; // mmceigr slot mask: "10" = slot 1, "01" = slot 2
+    uint32_t SettingsSize;
 } __attribute__((packed, aligned(4)));
 
 extern struct ee_core_data eec;
